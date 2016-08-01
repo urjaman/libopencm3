@@ -42,6 +42,7 @@ LGPL License Terms @ref lgpl_license
 
 BEGIN_DECLS
 
+#define USB_ENDPOINT_ATTR_DBLBUF 0x40
 
 enum usbd_request_return_codes {
 	USBD_REQ_NOTSUPP	= 0,

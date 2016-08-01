@@ -76,7 +76,10 @@ void st_usbfs_ep_setup(usbd_device *dev, uint8_t addr, uint8_t type,
 
 	/* Assign address. */
 	USB_SET_EP_ADDR(addr, addr);
-	USB_SET_EP_TYPE(addr, typelookup[type]);
+	USB_SET_EP_TYPE(addr, typelookup[type & USB_ENDPOINT_ATTR_TYPE]);
+
+	int doublebuf = (type==(USB_EP_TYPE_BULK|USB_ENDPOINT_ATTR_DBLBUF));
+	if (doublebuf) USB_SET_EP_KIND(addr);
 
 	if (dir || (addr == 0)) {
 		USB_SET_EP_TX_ADDR(addr, dev->pm_top);
@@ -85,6 +88,12 @@ void st_usbfs_ep_setup(usbd_device *dev, uint8_t addr, uint8_t type,
 			    (void *)callback;
 		}
 		USB_CLR_EP_TX_DTOG(addr);
+		if (doublebuf) {
+			dev->pm_top += max_size;
+			USB_SET_EP_RX_ADDR(addr, dev->pm_top);
+			USB_SET_EP_RX_STAT(addr, USB_EP_RX_STAT_DISABLED);
+			USB_CLR_EP_RX_DTOG(addr);
+		}
 		USB_SET_EP_TX_STAT(addr, USB_EP_TX_STAT_NAK);
 		dev->pm_top += max_size;
 	}
@@ -97,6 +106,13 @@ void st_usbfs_ep_setup(usbd_device *dev, uint8_t addr, uint8_t type,
 			    (void *)callback;
 		}
 		USB_CLR_EP_RX_DTOG(addr);
+		if (doublebuf) {
+			dev->pm_top += max_size;
+			USB_SET_EP_TX_ADDR(addr, dev->pm_top);
+			USB_SET_EP_TX_STAT(addr, USB_EP_TX_STAT_DISABLED);
+			USB_CLR_EP_TX_DTOG(addr);
+			USB_SET_EP_TX_COUNT(addr, USB_GET_EP_RX_COUNT(addr));
+		}
 		USB_SET_EP_RX_STAT(addr, USB_EP_RX_STAT_VALID);
 		dev->pm_top += max_size;
 	}
@@ -183,15 +199,38 @@ uint16_t st_usbfs_ep_write_packet(usbd_device *dev, uint8_t addr,
 {
 	(void)dev;
 	addr &= 0x7F;
+	uint16_t epnr = *USB_EP_REG(addr);
+	int dblbuf = ((epnr&(USB_EP_TYPE|USB_EP_KIND)) == (USB_EP_TYPE_BULK|USB_EP_KIND));
 
-	if ((*USB_EP_REG(addr) & USB_EP_TX_STAT) == USB_EP_TX_STAT_VALID) {
-		return 0;
+	if ((epnr & USB_EP_TX_STAT) == USB_EP_TX_STAT_VALID) {
+		if (dblbuf) {
+			/* Double-buffered, checking for SW_BUF == DTOG (==full, when status is valid) */
+			if (!(((epnr >> 8) ^ epnr) & USB_EP_TX_DTOG)) { // here this is just the lower DTOG (0x40)
+				return 0;
+			}
+		} else {
+			return 0;
+		}
 	}
-
-	st_usbfs_copy_to_pm(USB_GET_EP_TX_BUFF(addr), buf, len);
-	USB_SET_EP_TX_COUNT(addr, len);
-	USB_SET_EP_TX_STAT(addr, USB_EP_TX_STAT_VALID);
-
+	volatile void* tgtp;
+	if (!dblbuf) {
+		tgtp = USB_GET_EP_TX_BUFF(addr);
+		USB_SET_EP_TX_COUNT(addr, len);
+	} else {
+		if (epnr&USB_EP_RX_DTOG) { /* SW_BUF */
+			/*TX1*/
+			USB_SET_EP_RX_COUNT(addr, len);
+			tgtp = USB_GET_EP_RX_BUFF(addr);
+		} else {
+			/*TX0*/
+			USB_SET_EP_TX_COUNT(addr, len);
+			tgtp = USB_GET_EP_TX_BUFF(addr);
+		}
+	}
+	st_usbfs_copy_to_pm(tgtp, buf, len);
+	uint16_t epnrm = (epnr & USB_EP_NTOGGLE_MSK) | USB_EP_RX_CTR | USB_EP_TX_CTR;
+	if (dblbuf) epnrm |= USB_EP_RX_DTOG; /* toggle SW_BUF */
+	SET_REG(USB_EP_REG(addr), epnrm  | ( (epnr&USB_EP_TX_STAT) ^ USB_EP_TX_STAT_VALID) );
 	return len;
 }
 
@@ -199,18 +238,43 @@ uint16_t st_usbfs_ep_read_packet(usbd_device *dev, uint8_t addr,
 					 void *buf, uint16_t len)
 {
 	(void)dev;
-	if ((*USB_EP_REG(addr) & USB_EP_RX_STAT) == USB_EP_RX_STAT_VALID) {
-		return 0;
+	uint16_t epnr = *USB_EP_REG(addr);
+	int dblbuf = ((epnr&(USB_EP_TYPE|USB_EP_KIND)) == (USB_EP_TYPE_BULK|USB_EP_KIND));
+	if ((epnr & USB_EP_RX_STAT) == USB_EP_RX_STAT_VALID) {
+		if (dblbuf) {
+			/* Double-buffered, checking for SW_BUF == DTOG (==empty, when status is valid) */
+			if (!(((epnr >> 8) ^ epnr) & USB_EP_TX_DTOG)) { // here this is just the lower DTOG (0x40)
+				return 0;
+			}
+		} else {
+			return 0;
+		}
+	}
+	uint16_t ldat;
+	const volatile void* src;
+	if (!dblbuf) {
+		ldat = USB_GET_EP_RX_COUNT(addr);
+		src = USB_GET_EP_RX_BUFF(addr);
+	} else {
+		if (epnr&USB_EP_TX_DTOG) { /* SW_BUF */
+			/*RX1*/
+			ldat = USB_GET_EP_RX_COUNT(addr);
+			src = USB_GET_EP_RX_BUFF(addr);
+		} else {
+			/*RX0*/
+			ldat = USB_GET_EP_TX_COUNT(addr);
+			src = USB_GET_EP_TX_BUFF(addr);
+		}
 	}
 
-	len = MIN(USB_GET_EP_RX_COUNT(addr) & 0x3ff, len);
-	st_usbfs_copy_from_pm(buf, USB_GET_EP_RX_BUFF(addr), len);
-	USB_CLR_EP_RX_CTR(addr);
+	len = MIN(ldat & 0x3ff, len);
+	st_usbfs_copy_from_pm(buf, src, len);
 
 	if (!st_usbfs_force_nak[addr]) {
-		USB_SET_EP_RX_STAT(addr, USB_EP_RX_STAT_VALID);
+		uint16_t epnrm = (epnr & USB_EP_NTOGGLE_MSK) | USB_EP_RX_CTR | USB_EP_TX_CTR;
+		if (dblbuf) epnrm |= USB_EP_TX_DTOG; /* toggle SW_BUF */
+		SET_REG(USB_EP_REG(addr), epnrm  | ( (epnr&USB_EP_RX_STAT) ^ USB_EP_RX_STAT_VALID) );
 	}
-
 	return len;
 }
 
@@ -240,10 +304,10 @@ void st_usbfs_poll(usbd_device *dev)
 			type = USB_TRANSACTION_IN;
 			USB_CLR_EP_TX_CTR(ep);
 		}
-
 		if (dev->user_callback_ctr[ep][type]) {
 			dev->user_callback_ctr[ep][type] (dev, ep);
-		} else {
+		}
+		if (type != USB_TRANSACTION_IN) {
 			USB_CLR_EP_RX_CTR(ep);
 		}
 	}
